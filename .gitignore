@@ -1,0 +1,19 @@
+# Binary
+s3-cloudfront-cloner
+s3-cloudfront-cloner.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config
+.s3-cloudfront-cloner.yaml
+
+# Test
+coverage.out

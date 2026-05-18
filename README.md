@@ -103,6 +103,7 @@ s3-cloudfront-cloner clone \
 | `--verify` | Verify ETag/checksum after download |
 | `--preserve-metadata` | Preserve object metadata (Content-Type, Cache-Control, etc.) |
 | `--dry-run` | List what would be cloned without cloning |
+| `--skip-existing` | Skip objects whose destination already matches source size + checksum. Requires `--source-bucket` to fetch source checksums. For local destinations, the existing file is hashed (one pass over disk). For S3 destinations, a HeadObject is issued and any common S3 native checksum is compared (ETag as a fallback). |
 | `--range-threshold` | File size (bytes) above which chunked Range downloads are used (default: `5 GiB`). Applies to both local and S3 destinations. |
 | `--chunk-size` | Chunk size (bytes) for Range downloads (default: `256 MiB`). For S3 destinations each chunk maps to one multipart part, so this must be between 5 MiB and 5 GiB. |
 

@@ -3,9 +3,11 @@ package uploader
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 
 	"s3-cloudfront-cloner/internal/checksum"
@@ -16,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	smithy "github.com/aws/smithy-go"
 )
 
 // S3 multipart upload limits.
@@ -28,6 +31,12 @@ const (
 // Uploader interface for uploading objects
 type Uploader interface {
 	Upload(ctx context.Context, obj types.ObjectInfo, r io.Reader) error
+	// IsIdentical reports whether the destination already holds an object whose
+	// content matches obj (size + checksum). Returns (false, nil) when the
+	// destination is missing or differs; only returns an error for unexpected
+	// failures (network, permission). Callers should treat (false, error) as
+	// "fall through to a normal clone" rather than aborting.
+	IsIdentical(ctx context.Context, obj types.ObjectInfo) (bool, error)
 }
 
 // S3Uploader uploads objects to an S3 bucket
@@ -62,6 +71,84 @@ func NewS3Uploader(ctx context.Context, bucket, prefix, region string) (*S3Uploa
 		bucket:   bucket,
 		prefix:   prefix,
 	}, nil
+}
+
+// IsIdentical does a HeadObject on the destination key and compares against
+// the source's size + any available checksum. Returns true only when one of the
+// strong S3 native checksums (or the ETag, as a single-part fallback) matches —
+// composite-checksum mismatches are *not* treated as identical because the
+// source and destination may have used different multipart part sizes even
+// though the bytes are the same.
+func (u *S3Uploader) IsIdentical(ctx context.Context, obj types.ObjectInfo) (bool, error) {
+	key := u.prefix + obj.Key
+
+	resp, err := u.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket:       aws.String(u.bucket),
+		Key:          aws.String(key),
+		ChecksumMode: s3types.ChecksumModeEnabled,
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("HeadObject %s: %w", key, err)
+	}
+
+	if resp.ContentLength == nil || *resp.ContentLength != obj.Size {
+		return false, nil
+	}
+
+	return checksumsMatch(obj, resp), nil
+}
+
+// isNotFound recognizes both the typed NotFound error and the generic
+// 404-with-"NotFound"-code response that HeadObject returns for missing keys.
+func isNotFound(err error) bool {
+	var notFound *s3types.NotFound
+	if errors.As(err, &notFound) {
+		return true
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		code := apiErr.ErrorCode()
+		if code == "NotFound" || code == "NoSuchKey" {
+			return true
+		}
+	}
+	return false
+}
+
+// checksumsMatch compares source checksums to the destination HeadObject
+// response. Tries strong S3 native checksums first (CRC64NVME > SHA256 > SHA1 >
+// CRC32C > CRC32), then falls back to ETag. All comparisons are exact-string —
+// composite multipart checksums only match when the same part boundaries were
+// used on both sides.
+func checksumsMatch(src types.ObjectInfo, dst *s3.HeadObjectOutput) bool {
+	checks := []struct {
+		srcVal string
+		dstVal *string
+	}{
+		{src.ChecksumCRC64NVME, dst.ChecksumCRC64NVME},
+		{src.ChecksumSHA256, dst.ChecksumSHA256},
+		{src.ChecksumSHA1, dst.ChecksumSHA1},
+		{src.ChecksumCRC32C, dst.ChecksumCRC32C},
+		{src.ChecksumCRC32, dst.ChecksumCRC32},
+	}
+	for _, c := range checks {
+		if c.srcVal != "" && c.dstVal != nil && *c.dstVal != "" && c.srcVal == *c.dstVal {
+			return true
+		}
+	}
+
+	if src.ETag != "" && dst.ETag != nil {
+		srcETag := strings.Trim(src.ETag, "\"")
+		dstETag := strings.Trim(*dst.ETag, "\"")
+		if srcETag != "" && dstETag != "" && srcETag == dstETag {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Upload streams an object to S3 with metadata preservation

@@ -58,6 +58,7 @@ func init() {
 	cloneCmd.Flags().BoolVar(&config.Verify, "verify", false, "Verify ETag/checksum after download")
 	cloneCmd.Flags().BoolVar(&config.PreserveMetadata, "preserve-metadata", false, "Preserve object metadata")
 	cloneCmd.Flags().BoolVar(&config.DryRun, "dry-run", false, "List what would be cloned without cloning")
+	cloneCmd.Flags().BoolVar(&config.SkipExisting, "skip-existing", false, "Skip objects whose destination already matches source checksum")
 	cloneCmd.Flags().Int64Var(&config.RangeThreshold, "range-threshold", 5*1024*1024*1024, "File size threshold (bytes) for chunked Range downloads")
 	cloneCmd.Flags().Int64Var(&config.ChunkSize, "chunk-size", 256*1024*1024, "Chunk size (bytes) for Range downloads")
 
@@ -128,8 +129,9 @@ func runClone(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Fetch checksums (and per-part sizes for multipart sources) when verify is enabled.
-	if config.Verify && config.SourceBucket != "" {
+	// Fetch checksums (and per-part sizes for multipart sources) when verify or
+	// skip-existing is enabled — both need source-side checksums to compare against.
+	if (config.Verify || config.SkipExisting) && config.SourceBucket != "" {
 		fmt.Println("Fetching checksums for verification...")
 		if err := fetchVerificationData(ctx, objects); err != nil {
 			return fmt.Errorf("failed to fetch verification data: %w", err)
@@ -221,6 +223,7 @@ func printVerboseConfig() {
 	fmt.Printf("[verbose]   Concurrency: %d\n", config.Concurrency)
 	fmt.Printf("[verbose]   Verify: %t\n", config.Verify)
 	fmt.Printf("[verbose]   Preserve metadata: %t\n", config.PreserveMetadata)
+	fmt.Printf("[verbose]   Skip existing: %t\n", config.SkipExisting)
 }
 
 func formatBytes(bytes int64) string {
@@ -247,6 +250,10 @@ func validateConfig() error {
 
 	if config.Verify && config.SourceBucket == "" {
 		return fmt.Errorf("--source-bucket is required when --verify is enabled (needed to fetch x-amz-checksum-sha256 and per-part sizes)")
+	}
+
+	if config.SkipExisting && config.SourceBucket == "" {
+		return fmt.Errorf("--source-bucket is required when --skip-existing is enabled (needed to fetch checksums for identity comparison)")
 	}
 
 	if config.DestLocal == "" && config.DestBucket == "" {
@@ -457,10 +464,13 @@ func processObjects(ctx context.Context, objects []types.ObjectInfo, dl *downloa
 	for result := range results {
 		atomic.AddInt32(&completed, 1)
 
-		if result.Success {
+		switch {
+		case result.Skipped:
+			stats.SkippedCount++
+		case result.Success:
 			stats.SuccessCount++
 			stats.TransferredBytes += result.BytesRead
-		} else {
+		default:
 			stats.FailedCount++
 			fmt.Fprintf(os.Stderr, "Failed: %s - %v\n", result.Object.Key, result.Error)
 		}
@@ -483,6 +493,21 @@ func processObjects(ctx context.Context, objects []types.ObjectInfo, dl *downloa
 
 func processObject(ctx context.Context, obj types.ObjectInfo, dl *downloader.Downloader, up uploader.Uploader, v *verifier.Verifier) types.DownloadResult {
 	result := types.DownloadResult{Object: obj}
+
+	if config.SkipExisting {
+		identical, err := up.IsIdentical(ctx, obj)
+		if err != nil {
+			// Non-fatal: log and proceed with a normal clone.
+			fmt.Fprintf(os.Stderr, "Warning: skip-existing check failed for %s: %v\n", obj.Key, err)
+		} else if identical {
+			if Verbose() {
+				fmt.Printf("[verbose] Skipping %s — destination already matches source checksum\n", obj.Key)
+			}
+			result.Skipped = true
+			result.Success = true
+			return result
+		}
+	}
 
 	if Verbose() {
 		fmt.Printf("[verbose] Streaming: %s (%s)\n", obj.Key, formatBytes(obj.Size))
@@ -625,6 +650,9 @@ func printSummary(stats types.CloneStats) {
 	fmt.Println("\n=== Clone Summary ===")
 	fmt.Printf("Total objects:    %d\n", stats.TotalObjects)
 	fmt.Printf("Successful:       %d\n", stats.SuccessCount)
+	if config.SkipExisting {
+		fmt.Printf("Skipped:          %d\n", stats.SkippedCount)
+	}
 	fmt.Printf("Failed:           %d\n", stats.FailedCount)
 	fmt.Printf("Bytes transferred: %d\n", stats.TransferredBytes)
 

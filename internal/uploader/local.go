@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"s3-cloudfront-cloner/internal/checksum"
+	"s3-cloudfront-cloner/internal/verifier"
 	"s3-cloudfront-cloner/pkg/types"
 )
 
@@ -20,6 +22,41 @@ func NewLocalUploader(basePath string) *LocalUploader {
 	return &LocalUploader{
 		basePath: basePath,
 	}
+}
+
+// IsIdentical reads the existing local file (if any) at obj.Key, computes the
+// algorithms needed to verify against the source's checksums, and reports
+// whether they match. Returns (false, nil) when the file is missing or the
+// size differs; reads the file only when size already matches, so the
+// happy-path cost is one stat for missing/mismatched files.
+func (u *LocalUploader) IsIdentical(ctx context.Context, obj types.ObjectInfo) (bool, error) {
+	fullPath := filepath.Join(u.basePath, obj.Key)
+
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat %s: %w", fullPath, err)
+	}
+	if info.Size() != obj.Size {
+		return false, nil
+	}
+
+	algos := verifier.AlgosNeeded(obj)
+	f, err := os.Open(fullPath)
+	if err != nil {
+		return false, fmt.Errorf("open %s: %w", fullPath, err)
+	}
+	defer f.Close()
+
+	cw := checksum.NewWriter(algos, obj.PartSizes)
+	buf := make([]byte, 4*1024*1024)
+	if _, err := io.CopyBuffer(cw, f, buf); err != nil {
+		return false, fmt.Errorf("read %s: %w", fullPath, err)
+	}
+
+	return verifier.NewVerifier().Verify(obj, cw.Sums()).Verified, nil
 }
 
 // CreateFile preallocates a local file for direct parallel writes.

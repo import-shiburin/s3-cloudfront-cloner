@@ -75,6 +75,7 @@ type CloneConfig struct {
 	Verify           bool
 	PreserveMetadata bool
 	DryRun           bool
+	SkipExisting     bool // skip objects whose destination already matches source checksum
 
 	// Ranged download options
 	RangeThreshold int64 // bytes; files larger than this use chunked Range requests
@@ -90,6 +91,7 @@ type DownloadResult struct {
 	ChecksumSHA256 string // base64-encoded SHA256 of downloaded content
 	Verified       bool
 	VerifyFail     bool
+	Skipped        bool // destination already matched source; nothing transferred
 }
 
 // CloneStats holds statistics for a clone operation
@@ -97,6 +99,7 @@ type CloneStats struct {
 	TotalObjects     int
 	SuccessCount     int
 	FailedCount      int
+	SkippedCount     int
 	VerifiedCount    int
 	VerifyFailCount  int
 	TotalBytes       int64

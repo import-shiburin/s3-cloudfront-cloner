@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -55,7 +56,7 @@ func (d *Downloader) StreamDownload(ctx context.Context, key string, size int64,
 
 // singleStreamDownload is the original single-request download path.
 func (d *Downloader) singleStreamDownload(ctx context.Context, key string, algos []checksum.Algorithm, partSizes []int64, w io.Writer) (int64, map[checksum.Algorithm]checksum.Result, error) {
-	url := fmt.Sprintf("https://%s/%s", d.cloudFrontDomain, key)
+	url := d.buildURL(key)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -91,7 +92,7 @@ func (d *Downloader) singleStreamDownload(ctx context.Context, key string, algos
 func (d *Downloader) rangedStreamDownload(ctx context.Context, key string, size int64, algos []checksum.Algorithm, partSizes []int64, w io.Writer) (int64, map[checksum.Algorithm]checksum.Result, error) {
 	const chunkConcurrency = 4
 
-	url := fmt.Sprintf("https://%s/%s", d.cloudFrontDomain, key)
+	url := d.buildURL(key)
 	cw := checksum.NewWriter(algos, partSizes)
 	multiWriter := io.MultiWriter(w, cw)
 
@@ -168,7 +169,7 @@ func (d *Downloader) rangedStreamDownload(ctx context.Context, key string, size 
 func (d *Downloader) parallelRangedDownload(ctx context.Context, key string, size int64, algos []checksum.Algorithm, partSizes []int64, w io.WriterAt) (int64, map[checksum.Algorithm]checksum.Result, error) {
 	const chunkConcurrency = 8
 
-	url := fmt.Sprintf("https://%s/%s", d.cloudFrontDomain, key)
+	url := d.buildURL(key)
 	numChunks := (size + d.chunkSize - 1) / d.chunkSize
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -323,7 +324,7 @@ func (d *Downloader) streamChunk(ctx context.Context, url string, start, end int
 // DownloadChunk fetches a single byte-range chunk from CloudFront with retries.
 // Used by callers that orchestrate their own chunked download (e.g. S3 multipart upload).
 func (d *Downloader) DownloadChunk(ctx context.Context, key string, start, end int64) ([]byte, error) {
-	url := fmt.Sprintf("https://%s/%s", d.cloudFrontDomain, key)
+	url := d.buildURL(key)
 	return d.downloadChunkWithRetry(ctx, url, start, end)
 }
 
@@ -381,6 +382,20 @@ func (d *Downloader) downloadChunk(ctx context.Context, url string, start, end i
 	}
 
 	return data, nil
+}
+
+// buildURL turns an S3 object key into a properly escaped CloudFront URL.
+// Without escaping, keys containing '#' would be truncated at the fragment
+// delimiter before the request is sent, and keys with spaces / non-ASCII /
+// other reserved characters would either fail to parse or hit CloudFront
+// with a path that no longer matches the stored object — both surface as 403.
+func (d *Downloader) buildURL(key string) string {
+	u := &url.URL{
+		Scheme: "https",
+		Host:   d.cloudFrontDomain,
+		Path:   "/" + key,
+	}
+	return u.String()
 }
 
 // addCookies attaches the CloudFront signed cookies to an HTTP request.

@@ -77,6 +77,7 @@ s3-cloudfront-cloner clone \
 | `--source-bucket` | Source S3 bucket name |
 | `--source-file` | JSON file with object list (AWS CLI `list-objects-v2` format) |
 | `--prefix` | Prefix to filter objects |
+| `--strip-prefix` | Leading prefix to strip from each source key before joining with `--dest-prefix`. E.g. with `--strip-prefix bbb/ccc/`, source key `bbb/ccc/ddd/file` lands at `<dest-prefix>ddd/file` instead of `<dest-prefix>bbb/ccc/ddd/file`. |
 
 #### CloudFront
 

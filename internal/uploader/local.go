@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"s3-cloudfront-cloner/internal/checksum"
 	"s3-cloudfront-cloner/internal/verifier"
@@ -14,14 +15,29 @@ import (
 
 // LocalUploader saves objects to local filesystem
 type LocalUploader struct {
-	basePath string
+	basePath    string
+	stripPrefix string
 }
 
-// NewLocalUploader creates a new local filesystem uploader
-func NewLocalUploader(basePath string) *LocalUploader {
+// NewLocalUploader creates a new local filesystem uploader. stripPrefix is
+// removed from each source key before joining with basePath, mirroring the
+// behavior of NewS3Uploader so source paths can be collapsed onto a different
+// destination layout.
+func NewLocalUploader(basePath, stripPrefix string) *LocalUploader {
 	return &LocalUploader{
-		basePath: basePath,
+		basePath:    basePath,
+		stripPrefix: stripPrefix,
 	}
+}
+
+// destPath strips stripPrefix from srcKey (when set) and joins it with basePath.
+func (u *LocalUploader) destPath(srcKey string) string {
+	k := srcKey
+	if u.stripPrefix != "" {
+		k = strings.TrimPrefix(k, u.stripPrefix)
+		k = strings.TrimPrefix(k, "/")
+	}
+	return filepath.Join(u.basePath, k)
 }
 
 // IsIdentical reads the existing local file (if any) at obj.Key, computes the
@@ -30,7 +46,7 @@ func NewLocalUploader(basePath string) *LocalUploader {
 // size differs; reads the file only when size already matches, so the
 // happy-path cost is one stat for missing/mismatched files.
 func (u *LocalUploader) IsIdentical(ctx context.Context, obj types.ObjectInfo) (bool, error) {
-	fullPath := filepath.Join(u.basePath, obj.Key)
+	fullPath := u.destPath(obj.Key)
 
 	info, err := os.Stat(fullPath)
 	if err != nil {
@@ -61,7 +77,7 @@ func (u *LocalUploader) IsIdentical(ctx context.Context, obj types.ObjectInfo) (
 
 // CreateFile preallocates a local file for direct parallel writes.
 func (u *LocalUploader) CreateFile(obj types.ObjectInfo, size int64) (*os.File, error) {
-	fullPath := filepath.Join(u.basePath, obj.Key)
+	fullPath := u.destPath(obj.Key)
 
 	dir := filepath.Dir(fullPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -99,7 +115,7 @@ func (u *LocalUploader) FinishFile(f *os.File, obj types.ObjectInfo) error {
 // Upload streams an object to the local filesystem
 func (u *LocalUploader) Upload(ctx context.Context, obj types.ObjectInfo, r io.Reader) error {
 	// Construct full path preserving directory structure
-	fullPath := filepath.Join(u.basePath, obj.Key)
+	fullPath := u.destPath(obj.Key)
 
 	// Create parent directories
 	dir := filepath.Dir(fullPath)

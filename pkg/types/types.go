@@ -57,6 +57,7 @@ type CloneConfig struct {
 	SourceFile   string
 	SourceRegion string // overrides bucket region detection; "" means auto-detect
 	Prefix       string
+	StripPrefix  string // leading prefix removed from each source key before joining with DestPrefix
 
 	// CloudFront configuration
 	CloudFrontDomain string

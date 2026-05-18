@@ -41,15 +41,18 @@ type Uploader interface {
 
 // S3Uploader uploads objects to an S3 bucket
 type S3Uploader struct {
-	client   *s3.Client
-	uploader *manager.Uploader
-	bucket   string
-	prefix   string
+	client      *s3.Client
+	uploader    *manager.Uploader
+	bucket      string
+	prefix      string
+	stripPrefix string
 }
 
 // NewS3Uploader creates a new S3 uploader. If region is non-empty it overrides
 // whatever the default AWS config resolves; pass "" to use the default.
-func NewS3Uploader(ctx context.Context, bucket, prefix, region string) (*S3Uploader, error) {
+// stripPrefix is removed from each source key before joining with prefix, so
+// callers can collapse deep source paths onto a different destination layout.
+func NewS3Uploader(ctx context.Context, bucket, prefix, region, stripPrefix string) (*S3Uploader, error) {
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
@@ -66,11 +69,24 @@ func NewS3Uploader(ctx context.Context, bucket, prefix, region string) (*S3Uploa
 	})
 
 	return &S3Uploader{
-		client:   client,
-		uploader: uploader,
-		bucket:   bucket,
-		prefix:   prefix,
+		client:      client,
+		uploader:    uploader,
+		bucket:      bucket,
+		prefix:      prefix,
+		stripPrefix: stripPrefix,
 	}, nil
+}
+
+// destKey strips stripPrefix from srcKey (when set) and prepends the
+// destination prefix. The leading "/" cleanup avoids "fff/ggg//ddd" when
+// stripPrefix is supplied without a trailing slash.
+func (u *S3Uploader) destKey(srcKey string) string {
+	k := srcKey
+	if u.stripPrefix != "" {
+		k = strings.TrimPrefix(k, u.stripPrefix)
+		k = strings.TrimPrefix(k, "/")
+	}
+	return u.prefix + k
 }
 
 // IsIdentical does a HeadObject on the destination key and compares against
@@ -80,7 +96,7 @@ func NewS3Uploader(ctx context.Context, bucket, prefix, region string) (*S3Uploa
 // source and destination may have used different multipart part sizes even
 // though the bytes are the same.
 func (u *S3Uploader) IsIdentical(ctx context.Context, obj types.ObjectInfo) (bool, error) {
-	key := u.prefix + obj.Key
+	key := u.destKey(obj.Key)
 
 	resp, err := u.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket:       aws.String(u.bucket),
@@ -153,7 +169,7 @@ func checksumsMatch(src types.ObjectInfo, dst *s3.HeadObjectOutput) bool {
 
 // Upload streams an object to S3 with metadata preservation
 func (u *S3Uploader) Upload(ctx context.Context, obj types.ObjectInfo, r io.Reader) error {
-	key := u.prefix + obj.Key
+	key := u.destKey(obj.Key)
 
 	input := &s3.PutObjectInput{
 		Bucket: aws.String(u.bucket),
@@ -206,7 +222,7 @@ func (u *S3Uploader) UploadMultipart(
 		return 0, nil, fmt.Errorf("file size %d with chunk-size %d would require %d parts (S3 limit is %d); increase chunk-size", size, chunkSize, numChunks, S3MaxParts)
 	}
 
-	key := u.prefix + obj.Key
+	key := u.destKey(obj.Key)
 
 	createInput := &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(u.bucket),

@@ -40,6 +40,7 @@ func init() {
 	cloneCmd.Flags().StringVar(&config.SourceFile, "source-file", "", "JSON file with object list (AWS CLI format)")
 	cloneCmd.Flags().StringVar(&config.SourceRegion, "source-region", "", "Override source bucket region (auto-detected if unset)")
 	cloneCmd.Flags().StringVar(&config.Prefix, "prefix", "", "Prefix to filter objects")
+	cloneCmd.Flags().StringVar(&config.StripPrefix, "strip-prefix", "", "Leading prefix to strip from each source key before joining with --dest-prefix (e.g. --strip-prefix bbb/ccc/ turns bbb/ccc/ddd/file into ddd/file)")
 
 	// CloudFront flags
 	cloneCmd.Flags().StringVar(&config.CloudFrontDomain, "cloudfront-domain", "", "CloudFront distribution domain (required)")
@@ -169,12 +170,12 @@ func runClone(cmd *cobra.Command, args []string) error {
 		if Verbose() {
 			fmt.Printf("[verbose] Destination: local filesystem (%s)\n", config.DestLocal)
 		}
-		up = uploader.NewLocalUploader(config.DestLocal)
+		up = uploader.NewLocalUploader(config.DestLocal, config.StripPrefix)
 	} else {
 		if Verbose() {
 			fmt.Printf("[verbose] Destination: S3 bucket (%s/%s)\n", config.DestBucket, config.DestPrefix)
 		}
-		s3Up, err := uploader.NewS3Uploader(ctx, config.DestBucket, config.DestPrefix, config.DestRegion)
+		s3Up, err := uploader.NewS3Uploader(ctx, config.DestBucket, config.DestPrefix, config.DestRegion, config.StripPrefix)
 		if err != nil {
 			return fmt.Errorf("failed to create S3 uploader: %w", err)
 		}
@@ -217,6 +218,9 @@ func printVerboseConfig() {
 	}
 	if config.Prefix != "" {
 		fmt.Printf("[verbose]   Prefix: %s\n", config.Prefix)
+	}
+	if config.StripPrefix != "" {
+		fmt.Printf("[verbose]   Strip prefix: %s\n", config.StripPrefix)
 	}
 	fmt.Printf("[verbose]   CloudFront domain: %s\n", config.CloudFrontDomain)
 	fmt.Printf("[verbose]   Key pair ID: %s\n", config.KeyPairID)

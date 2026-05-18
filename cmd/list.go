@@ -23,6 +23,7 @@ var (
 	listBucket string
 	listPrefix string
 	listOutput string
+	listRegion string
 )
 
 func init() {
@@ -31,6 +32,7 @@ func init() {
 	listCmd.Flags().StringVar(&listBucket, "bucket", "", "S3 bucket name (required)")
 	listCmd.Flags().StringVar(&listPrefix, "prefix", "", "Prefix to filter objects")
 	listCmd.Flags().StringVarP(&listOutput, "output", "o", "", "Output file (default: stdout)")
+	listCmd.Flags().StringVar(&listRegion, "region", "", "Override bucket region (auto-detected if unset)")
 
 	listCmd.MarkFlagRequired("bucket")
 }
@@ -45,7 +47,19 @@ func runList(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	s3Lister, err := lister.NewS3Lister(ctx)
+	region := listRegion
+	if region == "" {
+		detected, err := lister.DetectBucketRegion(ctx, listBucket)
+		if err != nil {
+			return fmt.Errorf("detect bucket region: %w", err)
+		}
+		region = detected
+		if Verbose() {
+			fmt.Fprintf(os.Stderr, "[verbose] Bucket region: %s\n", region)
+		}
+	}
+
+	s3Lister, err := lister.NewS3Lister(ctx, region)
 	if err != nil {
 		return fmt.Errorf("failed to create S3 lister: %w", err)
 	}

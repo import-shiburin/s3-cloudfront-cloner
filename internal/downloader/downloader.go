@@ -2,14 +2,13 @@ package downloader
 
 import (
 	"context"
-	"crypto/md5"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"sync"
 	"time"
 
+	"s3-cloudfront-cloner/internal/checksum"
 	"s3-cloudfront-cloner/internal/cloudfront"
 )
 
@@ -39,119 +38,62 @@ func NewDownloader(cloudFrontDomain string, cookies *cloudfront.SignedCookies, r
 	}
 }
 
-// Download fetches an object from CloudFront and returns its content and MD5 hash
-func (d *Downloader) Download(ctx context.Context, key string) ([]byte, string, error) {
-	url := fmt.Sprintf("https://%s/%s", d.cloudFrontDomain, key)
-
-	var lastErr error
-	for attempt := 0; attempt <= d.maxRetries; attempt++ {
-		if attempt > 0 {
-			delay := d.retryDelay * time.Duration(1<<(attempt-1)) // Exponential backoff
-			select {
-			case <-ctx.Done():
-				return nil, "", ctx.Err()
-			case <-time.After(delay):
-			}
-		}
-
-		data, hash, err := d.doDownload(ctx, url)
-		if err == nil {
-			return data, hash, nil
-		}
-		lastErr = err
-	}
-
-	return nil, "", fmt.Errorf("download failed after %d retries: %w", d.maxRetries, lastErr)
-}
-
-func (d *Downloader) doDownload(ctx context.Context, url string) ([]byte, string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	d.addCookies(req)
-
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return nil, "", fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	// Read body while calculating MD5
-	hasher := md5.New()
-	reader := io.TeeReader(resp.Body, hasher)
-
-	data, err := io.ReadAll(reader)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	md5Hash := hex.EncodeToString(hasher.Sum(nil))
-
-	return data, md5Hash, nil
-}
-
-// StreamDownload downloads an object and streams it to a writer while calculating MD5.
-// If the file size exceeds the range threshold, it uses chunked Range requests.
-func (d *Downloader) StreamDownload(ctx context.Context, key string, size int64, w io.Writer) (int64, string, error) {
+// StreamDownload downloads an object and streams it to a writer while computing
+// the requested digests. partSizes carries the source's multipart boundaries
+// (empty for single-part sources) so composite digests match what S3 stores.
+// If the file size exceeds the range threshold, chunked Range requests are used.
+func (d *Downloader) StreamDownload(ctx context.Context, key string, size int64, algos []checksum.Algorithm, partSizes []int64, w io.Writer) (int64, map[checksum.Algorithm]checksum.Result, error) {
 	if size > 0 && size > d.rangeThreshold {
 		// If the writer supports WriteAt (e.g. *os.File), use fully parallel downloads.
 		if wa, ok := w.(io.WriterAt); ok {
-			return d.parallelRangedDownload(ctx, key, size, wa)
+			return d.parallelRangedDownload(ctx, key, size, algos, partSizes, wa)
 		}
-		return d.rangedStreamDownload(ctx, key, size, w)
+		return d.rangedStreamDownload(ctx, key, size, algos, partSizes, w)
 	}
-	return d.singleStreamDownload(ctx, key, w)
+	return d.singleStreamDownload(ctx, key, algos, partSizes, w)
 }
 
 // singleStreamDownload is the original single-request download path.
-func (d *Downloader) singleStreamDownload(ctx context.Context, key string, w io.Writer) (int64, string, error) {
+func (d *Downloader) singleStreamDownload(ctx context.Context, key string, algos []checksum.Algorithm, partSizes []int64, w io.Writer) (int64, map[checksum.Algorithm]checksum.Result, error) {
 	url := fmt.Sprintf("https://%s/%s", d.cloudFrontDomain, key)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return 0, "", fmt.Errorf("failed to create request: %w", err)
+		return 0, nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	d.addCookies(req)
 
 	resp, err := d.client.Do(req)
 	if err != nil {
-		return 0, "", fmt.Errorf("request failed: %w", err)
+		return 0, nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return 0, nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	// Stream to writer while calculating MD5
-	hasher := md5.New()
-	multiWriter := io.MultiWriter(w, hasher)
+	cw := checksum.NewWriter(algos, partSizes)
+	multiWriter := io.MultiWriter(w, cw)
 
 	n, err := io.Copy(multiWriter, resp.Body)
 	if err != nil {
-		return n, "", fmt.Errorf("failed to stream response: %w", err)
+		return n, nil, fmt.Errorf("failed to stream response: %w", err)
 	}
 
-	md5Hash := hex.EncodeToString(hasher.Sum(nil))
-	return n, md5Hash, nil
+	return n, cw.Sums(), nil
 }
 
 // rangedStreamDownload downloads a file using multiple concurrent HTTP Range
 // requests. Chunks are downloaded in parallel (up to 4 at a time) but written
 // to the output in sequential order to preserve correctness.
-func (d *Downloader) rangedStreamDownload(ctx context.Context, key string, size int64, w io.Writer) (int64, string, error) {
+func (d *Downloader) rangedStreamDownload(ctx context.Context, key string, size int64, algos []checksum.Algorithm, partSizes []int64, w io.Writer) (int64, map[checksum.Algorithm]checksum.Result, error) {
 	const chunkConcurrency = 4
 
 	url := fmt.Sprintf("https://%s/%s", d.cloudFrontDomain, key)
-	hasher := md5.New()
-	multiWriter := io.MultiWriter(w, hasher)
+	cw := checksum.NewWriter(algos, partSizes)
+	multiWriter := io.MultiWriter(w, cw)
 
 	numChunks := (size + d.chunkSize - 1) / d.chunkSize
 
@@ -206,26 +148,24 @@ func (d *Downloader) rangedStreamDownload(ctx context.Context, key string, size 
 
 		res := <-results[i]
 		if res.err != nil {
-			return totalWritten, "", fmt.Errorf("chunk [%d-%d] failed: %w", start, end, res.err)
+			return totalWritten, nil, fmt.Errorf("chunk [%d-%d] failed: %w", start, end, res.err)
 		}
 
 		n, err := multiWriter.Write(res.data)
 		totalWritten += int64(n)
 		if err != nil {
-			return totalWritten, "", fmt.Errorf("failed to write chunk [%d-%d]: %w", start, end, err)
+			return totalWritten, nil, fmt.Errorf("failed to write chunk [%d-%d]: %w", start, end, err)
 		}
 	}
 
-	md5Hash := hex.EncodeToString(hasher.Sum(nil))
-	return totalWritten, md5Hash, nil
+	return totalWritten, cw.Sums(), nil
 }
 
 // parallelRangedDownload downloads a file using fully parallel HTTP Range
 // requests with WriteAt. Each goroutine streams its chunk directly to the
-// file at the correct offset using a small buffer (~32 KB), so memory usage
-// is O(chunkConcurrency * 32KB) instead of O(chunkConcurrency * chunkSize).
-// MD5 is computed by re-reading the completed file afterward.
-func (d *Downloader) parallelRangedDownload(ctx context.Context, key string, size int64, w io.WriterAt) (int64, string, error) {
+// file at the correct offset using a small buffer (~32 KB). Hashes are
+// computed by re-reading the completed file afterward.
+func (d *Downloader) parallelRangedDownload(ctx context.Context, key string, size int64, algos []checksum.Algorithm, partSizes []int64, w io.WriterAt) (int64, map[checksum.Algorithm]checksum.Result, error) {
 	const chunkConcurrency = 8
 
 	url := fmt.Sprintf("https://%s/%s", d.cloudFrontDomain, key)
@@ -292,22 +232,21 @@ func (d *Downloader) parallelRangedDownload(ctx context.Context, key string, siz
 	wg.Wait() // ensure all goroutines finish before we return
 
 	if firstErr != nil {
-		return totalWritten, "", firstErr
+		return totalWritten, nil, firstErr
 	}
 
-	// Compute MD5 by re-reading the written data.
-	// Use a 4MB buffer so we issue large sequential reads instead of
-	// millions of 32KB ReadAt syscalls (the io.Copy default).
-	if ra, ok := w.(io.ReaderAt); ok {
-		hasher := md5.New()
-		buf := make([]byte, 4*1024*1024)
-		if _, err := io.CopyBuffer(hasher, io.NewSectionReader(ra, 0, size), buf); err != nil {
-			return totalWritten, "", fmt.Errorf("failed to compute MD5: %w", err)
-		}
-		return totalWritten, hex.EncodeToString(hasher.Sum(nil)), nil
+	// Compute hashes by re-reading the written data. Use a 4MB buffer so we
+	// issue large sequential reads instead of millions of 32KB ReadAt syscalls.
+	ra, ok := w.(io.ReaderAt)
+	if !ok {
+		return totalWritten, nil, nil
 	}
-
-	return totalWritten, "", nil
+	cw := checksum.NewWriter(algos, partSizes)
+	buf := make([]byte, 4*1024*1024)
+	if _, err := io.CopyBuffer(cw, io.NewSectionReader(ra, 0, size), buf); err != nil {
+		return totalWritten, nil, fmt.Errorf("failed to compute hashes: %w", err)
+	}
+	return totalWritten, cw.Sums(), nil
 }
 
 // streamChunkWithRetry streams a chunk directly to a WriterAt with retries.
@@ -381,6 +320,13 @@ func (d *Downloader) streamChunk(ctx context.Context, url string, start, end int
 	return written, nil
 }
 
+// DownloadChunk fetches a single byte-range chunk from CloudFront with retries.
+// Used by callers that orchestrate their own chunked download (e.g. S3 multipart upload).
+func (d *Downloader) DownloadChunk(ctx context.Context, key string, start, end int64) ([]byte, error) {
+	url := fmt.Sprintf("https://%s/%s", d.cloudFrontDomain, key)
+	return d.downloadChunkWithRetry(ctx, url, start, end)
+}
+
 // downloadChunkWithRetry attempts to download a single byte-range chunk with up to 5 retries.
 func (d *Downloader) downloadChunkWithRetry(ctx context.Context, url string, start, end int64) ([]byte, error) {
 	const maxChunkRetries = 5
@@ -407,6 +353,8 @@ func (d *Downloader) downloadChunkWithRetry(ctx context.Context, url string, sta
 }
 
 // downloadChunk issues a single HTTP Range request and returns the response body.
+// Reads into a pre-allocated buffer of the exact chunk size to avoid the
+// geometric-growth overhead of io.ReadAll.
 func (d *Downloader) downloadChunk(ctx context.Context, url string, start, end int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -426,8 +374,9 @@ func (d *Downloader) downloadChunk(ctx context.Context, url string, start, end i
 		return nil, fmt.Errorf("expected 206 Partial Content, got %d", resp.StatusCode)
 	}
 
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
+	chunkLen := end - start + 1
+	data := make([]byte, chunkLen)
+	if _, err := io.ReadFull(resp.Body, data); err != nil {
 		return nil, fmt.Errorf("failed to read chunk body: %w", err)
 	}
 

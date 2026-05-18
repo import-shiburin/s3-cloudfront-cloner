@@ -2,13 +2,16 @@ package cmd
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"s3-cloudfront-cloner/internal/checksum"
 	"s3-cloudfront-cloner/internal/cloudfront"
 	"s3-cloudfront-cloner/internal/downloader"
 	"s3-cloudfront-cloner/internal/lister"
@@ -35,6 +38,7 @@ func init() {
 	// Source flags
 	cloneCmd.Flags().StringVar(&config.SourceBucket, "source-bucket", "", "Source S3 bucket name")
 	cloneCmd.Flags().StringVar(&config.SourceFile, "source-file", "", "JSON file with object list (AWS CLI format)")
+	cloneCmd.Flags().StringVar(&config.SourceRegion, "source-region", "", "Override source bucket region (auto-detected if unset)")
 	cloneCmd.Flags().StringVar(&config.Prefix, "prefix", "", "Prefix to filter objects")
 
 	// CloudFront flags
@@ -47,6 +51,7 @@ func init() {
 	cloneCmd.Flags().StringVar(&config.DestLocal, "dest-local", "", "Local directory for downloads")
 	cloneCmd.Flags().StringVar(&config.DestBucket, "dest-bucket", "", "Destination S3 bucket")
 	cloneCmd.Flags().StringVar(&config.DestPrefix, "dest-prefix", "", "Prefix for destination objects")
+	cloneCmd.Flags().StringVar(&config.DestRegion, "dest-region", "", "Override destination bucket region (auto-detected if unset)")
 
 	// Operation flags
 	cloneCmd.Flags().IntVar(&config.Concurrency, "concurrency", 10, "Number of parallel downloads")
@@ -72,6 +77,13 @@ func runClone(cmd *cobra.Command, args []string) error {
 	// Print configuration in verbose mode
 	if Verbose() {
 		printVerboseConfig()
+	}
+
+	// Resolve bucket regions up front so every subsequent S3 client uses the
+	// right endpoint. Skipped for buckets the user didn't provide, and for
+	// regions that were explicitly overridden via flags.
+	if err := resolveRegions(ctx); err != nil {
+		return err
 	}
 
 	// Get object list
@@ -116,6 +128,14 @@ func runClone(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Fetch checksums (and per-part sizes for multipart sources) when verify is enabled.
+	if config.Verify && config.SourceBucket != "" {
+		fmt.Println("Fetching checksums for verification...")
+		if err := fetchVerificationData(ctx, objects); err != nil {
+			return fmt.Errorf("failed to fetch verification data: %w", err)
+		}
+	}
+
 	// Create CloudFront signer
 	if Verbose() {
 		fmt.Printf("[verbose] Loading private key from: %s\n", config.PrivateKeyPath)
@@ -152,7 +172,7 @@ func runClone(cmd *cobra.Command, args []string) error {
 		if Verbose() {
 			fmt.Printf("[verbose] Destination: S3 bucket (%s/%s)\n", config.DestBucket, config.DestPrefix)
 		}
-		s3Up, err := uploader.NewS3Uploader(ctx, config.DestBucket, config.DestPrefix)
+		s3Up, err := uploader.NewS3Uploader(ctx, config.DestBucket, config.DestPrefix, config.DestRegion)
 		if err != nil {
 			return fmt.Errorf("failed to create S3 uploader: %w", err)
 		}
@@ -225,12 +245,29 @@ func validateConfig() error {
 		return fmt.Errorf("--source-bucket is required when using --source-file with --preserve-metadata")
 	}
 
+	if config.Verify && config.SourceBucket == "" {
+		return fmt.Errorf("--source-bucket is required when --verify is enabled (needed to fetch x-amz-checksum-sha256 and per-part sizes)")
+	}
+
 	if config.DestLocal == "" && config.DestBucket == "" {
 		return fmt.Errorf("either --dest-local or --dest-bucket is required")
 	}
 
 	if config.DestLocal != "" && config.DestBucket != "" {
 		return fmt.Errorf("only one of --dest-local or --dest-bucket can be specified")
+	}
+
+	if config.ChunkSize <= 0 {
+		return fmt.Errorf("--chunk-size must be positive, got %d", config.ChunkSize)
+	}
+
+	if config.DestBucket != "" {
+		if config.ChunkSize < uploader.S3MinPartSize {
+			return fmt.Errorf("--chunk-size must be at least %d bytes (5 MiB) for S3 destinations, got %d", uploader.S3MinPartSize, config.ChunkSize)
+		}
+		if config.ChunkSize > uploader.S3MaxPartSize {
+			return fmt.Errorf("--chunk-size must be at most %d bytes (5 GiB) for S3 destinations, got %d", uploader.S3MaxPartSize, config.ChunkSize)
+		}
 	}
 
 	return nil
@@ -241,7 +278,7 @@ func getObjects(ctx context.Context) ([]types.ObjectInfo, error) {
 		return lister.ListFromFile(config.SourceFile)
 	}
 
-	s3Lister, err := lister.NewS3Lister(ctx)
+	s3Lister, err := lister.NewS3Lister(ctx, config.SourceRegion)
 	if err != nil {
 		return nil, err
 	}
@@ -249,8 +286,34 @@ func getObjects(ctx context.Context) ([]types.ObjectInfo, error) {
 	return s3Lister.ListObjects(ctx, config.SourceBucket, config.Prefix)
 }
 
+// resolveRegions auto-detects the source and destination bucket regions when
+// the user didn't explicitly set them via --source-region / --dest-region.
+func resolveRegions(ctx context.Context) error {
+	if config.SourceBucket != "" && config.SourceRegion == "" {
+		region, err := lister.DetectBucketRegion(ctx, config.SourceBucket)
+		if err != nil {
+			return fmt.Errorf("detect source-bucket region: %w", err)
+		}
+		config.SourceRegion = region
+		if Verbose() {
+			fmt.Printf("[verbose] Source bucket region: %s\n", region)
+		}
+	}
+	if config.DestBucket != "" && config.DestRegion == "" {
+		region, err := lister.DetectBucketRegion(ctx, config.DestBucket)
+		if err != nil {
+			return fmt.Errorf("detect dest-bucket region: %w", err)
+		}
+		config.DestRegion = region
+		if Verbose() {
+			fmt.Printf("[verbose] Dest bucket region: %s\n", region)
+		}
+	}
+	return nil
+}
+
 func fetchMetadata(ctx context.Context, objects []types.ObjectInfo) error {
-	s3Lister, err := lister.NewS3Lister(ctx)
+	s3Lister, err := lister.NewS3Lister(ctx, config.SourceRegion)
 	if err != nil {
 		return err
 	}
@@ -262,6 +325,96 @@ func fetchMetadata(ctx context.Context, objects []types.ObjectInfo) error {
 	}
 
 	return nil
+}
+
+// fetchVerificationData populates the source object's checksum-related fields
+// so the verifier has something to compare against. Called only when --verify
+// is enabled with a source bucket. PartSizes is fetched only when no
+// FullObject-style checksum (any S3 algorithm with no "-N" suffix, or rclone's
+// x-amz-meta-md5chksum) is already present — without those the verifier needs
+// per-part boundaries for composite-checksum or composite-ETag fallback.
+//
+// Failures are aggregated and surfaced upfront so users see the verifiability
+// of their planned clone *before* downloading 200 GB.
+func fetchVerificationData(ctx context.Context, objects []types.ObjectInfo) error {
+	s3Lister, err := lister.NewS3Lister(ctx, config.SourceRegion)
+	if err != nil {
+		return err
+	}
+
+	var (
+		withFullObj   int
+		withRclone    int
+		withPartSizes int
+		needPartSizes int
+		checksumFails int
+		partSizeFails int
+		firstCkErr    error
+		firstPartErr  error
+	)
+
+	for i := range objects {
+		if !hasAnyChecksum(&objects[i]) {
+			if err := s3Lister.FetchChecksum(ctx, config.SourceBucket, &objects[i]); err != nil {
+				checksumFails++
+				if firstCkErr == nil {
+					firstCkErr = err
+				}
+			}
+		}
+
+		if hasFullObjectChecksum(&objects[i]) {
+			withFullObj++
+		}
+		if objects[i].RcloneMD5Base64 != "" {
+			withRclone++
+		}
+
+		// Need PartSizes only if no full-object checksum or rclone MD5 covers
+		// verification AND the source is multipart.
+		isMultipart := strings.Contains(strings.Trim(objects[i].ETag, "\""), "-")
+		if !isMultipart {
+			continue
+		}
+		if hasFullObjectChecksum(&objects[i]) || objects[i].RcloneMD5Base64 != "" {
+			continue
+		}
+		needPartSizes++
+		if err := s3Lister.FetchPartSizes(ctx, config.SourceBucket, &objects[i]); err != nil {
+			partSizeFails++
+			if firstPartErr == nil {
+				firstPartErr = fmt.Errorf("%s: %w", objects[i].Key, err)
+			}
+		} else {
+			withPartSizes++
+		}
+	}
+
+	fmt.Printf("Verification coverage: %d full-object checksums, %d rclone md5chksum, %d/%d composite-only multipart need part sizes (%d fetched)\n",
+		withFullObj, withRclone, withPartSizes, needPartSizes, withPartSizes)
+	if checksumFails > 0 {
+		fmt.Fprintf(os.Stderr, "Warning: %d HeadObject failures (first: %v)\n", checksumFails, firstCkErr)
+	}
+	if partSizeFails > 0 {
+		fmt.Fprintf(os.Stderr, "Warning: %d GetObjectAttributes failures (first: %v)\n", partSizeFails, firstPartErr)
+		fmt.Fprintln(os.Stderr, "         Those objects will fall back to ETag with no PartSizes — verification will fail.")
+	}
+
+	return nil
+}
+
+func hasAnyChecksum(o *types.ObjectInfo) bool {
+	return o.ChecksumCRC32 != "" || o.ChecksumCRC32C != "" || o.ChecksumCRC64NVME != "" ||
+		o.ChecksumSHA1 != "" || o.ChecksumSHA256 != "" || o.RcloneMD5Base64 != ""
+}
+
+func hasFullObjectChecksum(o *types.ObjectInfo) bool {
+	for _, c := range []string{o.ChecksumCRC32, o.ChecksumCRC32C, o.ChecksumCRC64NVME, o.ChecksumSHA1, o.ChecksumSHA256} {
+		if c != "" && !strings.Contains(c, "-") {
+			return true
+		}
+	}
+	return false
 }
 
 func processObjects(ctx context.Context, objects []types.ObjectInfo, dl *downloader.Downloader, up uploader.Uploader, v *verifier.Verifier) types.CloneStats {
@@ -352,7 +505,8 @@ func processObject(ctx context.Context, obj types.ObjectInfo, dl *downloader.Dow
 			}
 		}
 
-		n, md5Hash, err := streamObject(ctx, obj, dl, up)
+		algos := verifier.AlgosNeeded(obj)
+		n, sums, err := streamObject(ctx, obj, dl, up, algos)
 		if err != nil {
 			lastErr = err
 			if Verbose() {
@@ -362,28 +516,24 @@ func processObject(ctx context.Context, obj types.ObjectInfo, dl *downloader.Dow
 		}
 
 		result.BytesRead = n
-		result.MD5Hash = md5Hash
-
-		if Verbose() {
-			fmt.Printf("[verbose] Streamed: %s (MD5: %s)\n", obj.Key, md5Hash)
+		if r, ok := sums[checksum.AlgSHA256]; ok && r.FullObject != nil {
+			result.ChecksumSHA256 = base64.StdEncoding.EncodeToString(r.FullObject)
 		}
 
-		// Verify if enabled
-		if v != nil {
-			verified, verr := v.Verify(obj, md5Hash)
-			if verr != nil {
-				fmt.Fprintf(os.Stderr, "Warning: verification error for %s: %v\n", obj.Key, verr)
-			}
-			result.Verified = verified
-			result.VerifyFail = !verified && verr == nil
+		if Verbose() {
+			fmt.Printf("[verbose] Streamed: %s\n", obj.Key)
+		}
 
+		if v != nil {
+			vr := v.Verify(obj, sums)
+			result.Verified = vr.Verified
+			result.VerifyFail = !vr.Verified
+			if !vr.Verified {
+				fmt.Fprintf(os.Stderr, "Verify FAILED: %s — %s\n", obj.Key, vr.Reason)
+			}
 			if Verbose() {
-				if verified {
-					fmt.Printf("[verbose] Verified: %s (ETag match)\n", obj.Key)
-				} else if verr != nil {
-					fmt.Printf("[verbose] Verify skipped: %s (%v)\n", obj.Key, verr)
-				} else {
-					fmt.Printf("[verbose] Verify FAILED: %s (expected: %s, got: %s)\n", obj.Key, obj.ETag, md5Hash)
+				if vr.Verified {
+					fmt.Printf("[verbose] Verified: %s (via %s)\n", obj.Key, vr.Method)
 				}
 			}
 		}
@@ -397,46 +547,63 @@ func processObject(ctx context.Context, obj types.ObjectInfo, dl *downloader.Dow
 }
 
 // streamObject pipes data from CloudFront directly to the uploader without
-// buffering the entire file in memory. MD5 is computed as data flows through.
+// buffering the entire file in memory. The requested digest algorithms are
+// computed as data flows through and returned in a Sums map.
 //
 // For local destinations with large files, the file is preallocated and chunks
-// are written in parallel via WriteAt, bypassing the pipe.
-func streamObject(ctx context.Context, obj types.ObjectInfo, dl *downloader.Downloader, up uploader.Uploader) (int64, string, error) {
+// are written in parallel via WriteAt, bypassing the pipe. For S3 destinations
+// with large files, a parallel multipart upload combines parallel Range
+// downloads with parallel UploadPart calls — each chunk maps to one S3 part.
+func streamObject(ctx context.Context, obj types.ObjectInfo, dl *downloader.Downloader, up uploader.Uploader, algos []checksum.Algorithm) (int64, map[checksum.Algorithm]checksum.Result, error) {
+	isLarge := obj.Size > 0 && obj.Size > config.RangeThreshold
+
 	// Fast path: local uploader + ranged download → preallocate and write directly.
-	if localUp, ok := up.(*uploader.LocalUploader); ok && obj.Size > 0 && obj.Size > config.RangeThreshold {
+	if localUp, ok := up.(*uploader.LocalUploader); ok && isLarge {
 		f, err := localUp.CreateFile(obj, obj.Size)
 		if err != nil {
-			return 0, "", fmt.Errorf("create file: %w", err)
+			return 0, nil, fmt.Errorf("create file: %w", err)
 		}
 
-		n, md5Hash, dlErr := dl.StreamDownload(ctx, obj.Key, obj.Size, f)
+		n, sums, dlErr := dl.StreamDownload(ctx, obj.Key, obj.Size, algos, obj.PartSizes, f)
 		finishErr := localUp.FinishFile(f, obj)
 
 		if dlErr != nil || finishErr != nil {
 			os.Remove(f.Name())
 			if dlErr != nil {
-				return 0, "", fmt.Errorf("download: %w", dlErr)
+				return 0, nil, fmt.Errorf("download: %w", dlErr)
 			}
-			return 0, "", fmt.Errorf("finish: %w", finishErr)
+			return 0, nil, fmt.Errorf("finish: %w", finishErr)
 		}
 
-		return n, md5Hash, nil
+		return n, sums, nil
+	}
+
+	// Fast path: S3 uploader + ranged download → parallel multipart upload.
+	// Skipped when the file fits in a single chunk; the pipe path is simpler there.
+	if s3Up, ok := up.(*uploader.S3Uploader); ok && isLarge {
+		numChunks := (obj.Size + config.ChunkSize - 1) / config.ChunkSize
+		if numChunks > 1 {
+			downloadFn := func(ctx context.Context, start, end int64) ([]byte, error) {
+				return dl.DownloadChunk(ctx, obj.Key, start, end)
+			}
+			return s3Up.UploadMultipart(ctx, obj, obj.Size, config.ChunkSize, algos, downloadFn)
+		}
 	}
 
 	// Standard path: pipe download into uploader (S3 or small local files).
 	pr, pw := io.Pipe()
 
 	type dlResult struct {
-		n       int64
-		md5Hash string
-		err     error
+		n    int64
+		sums map[checksum.Algorithm]checksum.Result
+		err  error
 	}
 	ch := make(chan dlResult, 1)
 
 	go func() {
-		n, hash, err := dl.StreamDownload(ctx, obj.Key, obj.Size, pw)
+		n, sums, err := dl.StreamDownload(ctx, obj.Key, obj.Size, algos, obj.PartSizes, pw)
 		pw.CloseWithError(err) // nil means normal EOF
-		ch <- dlResult{n, hash, err}
+		ch <- dlResult{n, sums, err}
 	}()
 
 	uploadErr := up.Upload(ctx, obj, pr)
@@ -445,13 +612,13 @@ func streamObject(ctx context.Context, obj types.ObjectInfo, dl *downloader.Down
 	res := <-ch
 
 	if res.err != nil {
-		return 0, "", fmt.Errorf("download: %w", res.err)
+		return 0, nil, fmt.Errorf("download: %w", res.err)
 	}
 	if uploadErr != nil {
-		return 0, "", fmt.Errorf("upload: %w", uploadErr)
+		return 0, nil, fmt.Errorf("upload: %w", uploadErr)
 	}
 
-	return res.n, res.md5Hash, nil
+	return res.n, res.sums, nil
 }
 
 func printSummary(stats types.CloneStats) {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"s3-cloudfront-cloner/internal/cloudfront"
@@ -19,18 +20,22 @@ type Downloader struct {
 	client           *http.Client
 	maxRetries       int
 	retryDelay       time.Duration
+	rangeThreshold   int64
+	chunkSize        int64
 }
 
 // NewDownloader creates a new CloudFront downloader
-func NewDownloader(cloudFrontDomain string, cookies *cloudfront.SignedCookies) *Downloader {
+func NewDownloader(cloudFrontDomain string, cookies *cloudfront.SignedCookies, rangeThreshold, chunkSize int64) *Downloader {
 	return &Downloader{
 		cloudFrontDomain: cloudFrontDomain,
 		cookies:          cookies,
 		client: &http.Client{
 			Timeout: 5 * time.Minute,
 		},
-		maxRetries: 3,
-		retryDelay: time.Second,
+		maxRetries:     3,
+		retryDelay:     time.Second,
+		rangeThreshold: rangeThreshold,
+		chunkSize:      chunkSize,
 	}
 }
 
@@ -65,19 +70,7 @@ func (d *Downloader) doDownload(ctx context.Context, url string) ([]byte, string
 		return nil, "", fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Add signed cookies
-	req.AddCookie(&http.Cookie{
-		Name:  "CloudFront-Policy",
-		Value: d.cookies.Policy,
-	})
-	req.AddCookie(&http.Cookie{
-		Name:  "CloudFront-Signature",
-		Value: d.cookies.Signature,
-	})
-	req.AddCookie(&http.Cookie{
-		Name:  "CloudFront-Key-Pair-Id",
-		Value: d.cookies.KeyPairID,
-	})
+	d.addCookies(req)
 
 	resp, err := d.client.Do(req)
 	if err != nil {
@@ -103,8 +96,21 @@ func (d *Downloader) doDownload(ctx context.Context, url string) ([]byte, string
 	return data, md5Hash, nil
 }
 
-// StreamDownload downloads an object and streams it to a writer while calculating MD5
-func (d *Downloader) StreamDownload(ctx context.Context, key string, w io.Writer) (int64, string, error) {
+// StreamDownload downloads an object and streams it to a writer while calculating MD5.
+// If the file size exceeds the range threshold, it uses chunked Range requests.
+func (d *Downloader) StreamDownload(ctx context.Context, key string, size int64, w io.Writer) (int64, string, error) {
+	if size > 0 && size > d.rangeThreshold {
+		// If the writer supports WriteAt (e.g. *os.File), use fully parallel downloads.
+		if wa, ok := w.(io.WriterAt); ok {
+			return d.parallelRangedDownload(ctx, key, size, wa)
+		}
+		return d.rangedStreamDownload(ctx, key, size, w)
+	}
+	return d.singleStreamDownload(ctx, key, w)
+}
+
+// singleStreamDownload is the original single-request download path.
+func (d *Downloader) singleStreamDownload(ctx context.Context, key string, w io.Writer) (int64, string, error) {
 	url := fmt.Sprintf("https://%s/%s", d.cloudFrontDomain, key)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -112,19 +118,7 @@ func (d *Downloader) StreamDownload(ctx context.Context, key string, w io.Writer
 		return 0, "", fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Add signed cookies
-	req.AddCookie(&http.Cookie{
-		Name:  "CloudFront-Policy",
-		Value: d.cookies.Policy,
-	})
-	req.AddCookie(&http.Cookie{
-		Name:  "CloudFront-Signature",
-		Value: d.cookies.Signature,
-	})
-	req.AddCookie(&http.Cookie{
-		Name:  "CloudFront-Key-Pair-Id",
-		Value: d.cookies.KeyPairID,
-	})
+	d.addCookies(req)
 
 	resp, err := d.client.Do(req)
 	if err != nil {
@@ -146,6 +140,312 @@ func (d *Downloader) StreamDownload(ctx context.Context, key string, w io.Writer
 	}
 
 	md5Hash := hex.EncodeToString(hasher.Sum(nil))
-
 	return n, md5Hash, nil
+}
+
+// rangedStreamDownload downloads a file using multiple concurrent HTTP Range
+// requests. Chunks are downloaded in parallel (up to 4 at a time) but written
+// to the output in sequential order to preserve correctness.
+func (d *Downloader) rangedStreamDownload(ctx context.Context, key string, size int64, w io.Writer) (int64, string, error) {
+	const chunkConcurrency = 4
+
+	url := fmt.Sprintf("https://%s/%s", d.cloudFrontDomain, key)
+	hasher := md5.New()
+	multiWriter := io.MultiWriter(w, hasher)
+
+	numChunks := (size + d.chunkSize - 1) / d.chunkSize
+
+	type chunkResult struct {
+		data []byte
+		err  error
+	}
+
+	// One channel per chunk so we can consume results in order.
+	results := make([]chan chunkResult, numChunks)
+	for i := range results {
+		results[i] = make(chan chunkResult, 1)
+	}
+
+	// Child context lets us cancel in-flight downloads on failure.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	sem := make(chan struct{}, chunkConcurrency)
+
+	for i := int64(0); i < numChunks; i++ {
+		start := i * d.chunkSize
+		end := start + d.chunkSize - 1
+		if end >= size {
+			end = size - 1
+		}
+		idx := i
+
+		go func() {
+			// Acquire semaphore or bail on cancellation.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				results[idx] <- chunkResult{nil, ctx.Err()}
+				return
+			}
+			defer func() { <-sem }()
+
+			data, err := d.downloadChunkWithRetry(ctx, url, start, end)
+			results[idx] <- chunkResult{data, err}
+		}()
+	}
+
+	// Write chunks in order.
+	var totalWritten int64
+	for i := int64(0); i < numChunks; i++ {
+		start := i * d.chunkSize
+		end := start + d.chunkSize - 1
+		if end >= size {
+			end = size - 1
+		}
+
+		res := <-results[i]
+		if res.err != nil {
+			return totalWritten, "", fmt.Errorf("chunk [%d-%d] failed: %w", start, end, res.err)
+		}
+
+		n, err := multiWriter.Write(res.data)
+		totalWritten += int64(n)
+		if err != nil {
+			return totalWritten, "", fmt.Errorf("failed to write chunk [%d-%d]: %w", start, end, err)
+		}
+	}
+
+	md5Hash := hex.EncodeToString(hasher.Sum(nil))
+	return totalWritten, md5Hash, nil
+}
+
+// parallelRangedDownload downloads a file using fully parallel HTTP Range
+// requests with WriteAt. Each goroutine streams its chunk directly to the
+// file at the correct offset using a small buffer (~32 KB), so memory usage
+// is O(chunkConcurrency * 32KB) instead of O(chunkConcurrency * chunkSize).
+// MD5 is computed by re-reading the completed file afterward.
+func (d *Downloader) parallelRangedDownload(ctx context.Context, key string, size int64, w io.WriterAt) (int64, string, error) {
+	const chunkConcurrency = 8
+
+	url := fmt.Sprintf("https://%s/%s", d.cloudFrontDomain, key)
+	numChunks := (size + d.chunkSize - 1) / d.chunkSize
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type chunkResult struct {
+		n   int64
+		err error
+	}
+
+	results := make([]chan chunkResult, numChunks)
+	for i := range results {
+		results[i] = make(chan chunkResult, 1)
+	}
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, chunkConcurrency)
+
+	for i := int64(0); i < numChunks; i++ {
+		start := i * d.chunkSize
+		end := start + d.chunkSize - 1
+		if end >= size {
+			end = size - 1
+		}
+		idx := i
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				results[idx] <- chunkResult{0, ctx.Err()}
+				return
+			}
+			defer func() { <-sem }()
+
+			n, err := d.streamChunkWithRetry(ctx, url, start, end, w)
+			results[idx] <- chunkResult{n, err}
+		}()
+	}
+
+	// Collect results — order only matters for error reporting.
+	var totalWritten int64
+	var firstErr error
+	for i := int64(0); i < numChunks; i++ {
+		res := <-results[i]
+		if res.err != nil && firstErr == nil {
+			start := i * d.chunkSize
+			end := start + d.chunkSize - 1
+			if end >= size {
+				end = size - 1
+			}
+			firstErr = fmt.Errorf("chunk [%d-%d] failed: %w", start, end, res.err)
+			cancel()
+		}
+		totalWritten += res.n
+	}
+
+	wg.Wait() // ensure all goroutines finish before we return
+
+	if firstErr != nil {
+		return totalWritten, "", firstErr
+	}
+
+	// Compute MD5 by re-reading the written data.
+	// Use a 4MB buffer so we issue large sequential reads instead of
+	// millions of 32KB ReadAt syscalls (the io.Copy default).
+	if ra, ok := w.(io.ReaderAt); ok {
+		hasher := md5.New()
+		buf := make([]byte, 4*1024*1024)
+		if _, err := io.CopyBuffer(hasher, io.NewSectionReader(ra, 0, size), buf); err != nil {
+			return totalWritten, "", fmt.Errorf("failed to compute MD5: %w", err)
+		}
+		return totalWritten, hex.EncodeToString(hasher.Sum(nil)), nil
+	}
+
+	return totalWritten, "", nil
+}
+
+// streamChunkWithRetry streams a chunk directly to a WriterAt with retries.
+// On retry the entire chunk range is re-downloaded, overwriting any partial data.
+func (d *Downloader) streamChunkWithRetry(ctx context.Context, url string, start, end int64, w io.WriterAt) (int64, error) {
+	const maxChunkRetries = 5
+	var lastErr error
+
+	for attempt := 0; attempt <= maxChunkRetries; attempt++ {
+		if attempt > 0 {
+			delay := d.retryDelay * time.Duration(1<<(attempt-1))
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		n, err := d.streamChunk(ctx, url, start, end, w)
+		if err == nil {
+			return n, nil
+		}
+		lastErr = err
+	}
+
+	return 0, fmt.Errorf("failed after %d retries: %w", maxChunkRetries, lastErr)
+}
+
+// streamChunk issues a Range request and streams the response body directly
+// to a WriterAt at the correct offset using a small read buffer.
+func (d *Downloader) streamChunk(ctx context.Context, url string, start, end int64, w io.WriterAt) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	d.addCookies(req)
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusPartialContent {
+		return 0, fmt.Errorf("expected 206 Partial Content, got %d", resp.StatusCode)
+	}
+
+	buf := make([]byte, 32*1024)
+	var written int64
+	offset := start
+	for {
+		nr, readErr := resp.Body.Read(buf)
+		if nr > 0 {
+			nw, writeErr := w.WriteAt(buf[:nr], offset)
+			written += int64(nw)
+			offset += int64(nw)
+			if writeErr != nil {
+				return written, fmt.Errorf("write failed: %w", writeErr)
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return written, fmt.Errorf("read failed: %w", readErr)
+		}
+	}
+
+	return written, nil
+}
+
+// downloadChunkWithRetry attempts to download a single byte-range chunk with up to 5 retries.
+func (d *Downloader) downloadChunkWithRetry(ctx context.Context, url string, start, end int64) ([]byte, error) {
+	const maxChunkRetries = 5
+	var lastErr error
+
+	for attempt := 0; attempt <= maxChunkRetries; attempt++ {
+		if attempt > 0 {
+			delay := d.retryDelay * time.Duration(1<<(attempt-1))
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		data, err := d.downloadChunk(ctx, url, start, end)
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+	}
+
+	return nil, fmt.Errorf("failed after %d retries: %w", maxChunkRetries, lastErr)
+}
+
+// downloadChunk issues a single HTTP Range request and returns the response body.
+func (d *Downloader) downloadChunk(ctx context.Context, url string, start, end int64) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	d.addCookies(req)
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusPartialContent {
+		return nil, fmt.Errorf("expected 206 Partial Content, got %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read chunk body: %w", err)
+	}
+
+	return data, nil
+}
+
+// addCookies attaches the CloudFront signed cookies to an HTTP request.
+func (d *Downloader) addCookies(req *http.Request) {
+	req.AddCookie(&http.Cookie{
+		Name:  "CloudFront-Policy",
+		Value: d.cookies.Policy,
+	})
+	req.AddCookie(&http.Cookie{
+		Name:  "CloudFront-Signature",
+		Value: d.cookies.Signature,
+	})
+	req.AddCookie(&http.Cookie{
+		Name:  "CloudFront-Key-Pair-Id",
+		Value: d.cookies.KeyPairID,
+	})
 }

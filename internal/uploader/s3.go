@@ -1,9 +1,9 @@
 package uploader
 
 import (
-	"bytes"
 	"context"
 	"fmt"
+	"io"
 
 	"s3-cloudfront-cloner/pkg/types"
 
@@ -15,16 +15,15 @@ import (
 
 // Uploader interface for uploading objects
 type Uploader interface {
-	Upload(ctx context.Context, obj types.ObjectInfo, data []byte) error
+	Upload(ctx context.Context, obj types.ObjectInfo, r io.Reader) error
 }
 
 // S3Uploader uploads objects to an S3 bucket
 type S3Uploader struct {
-	client         *s3.Client
-	uploader       *manager.Uploader
-	bucket         string
-	prefix         string
-	multipartSize  int64
+	client   *s3.Client
+	uploader *manager.Uploader
+	bucket   string
+	prefix   string
 }
 
 // NewS3Uploader creates a new S3 uploader
@@ -42,22 +41,21 @@ func NewS3Uploader(ctx context.Context, bucket, prefix string) (*S3Uploader, err
 	})
 
 	return &S3Uploader{
-		client:        client,
-		uploader:      uploader,
-		bucket:        bucket,
-		prefix:        prefix,
-		multipartSize: 5 * 1024 * 1024, // 5MB threshold
+		client:   client,
+		uploader: uploader,
+		bucket:   bucket,
+		prefix:   prefix,
 	}, nil
 }
 
-// Upload uploads an object to S3 with metadata preservation
-func (u *S3Uploader) Upload(ctx context.Context, obj types.ObjectInfo, data []byte) error {
+// Upload streams an object to S3 with metadata preservation
+func (u *S3Uploader) Upload(ctx context.Context, obj types.ObjectInfo, r io.Reader) error {
 	key := u.prefix + obj.Key
 
 	input := &s3.PutObjectInput{
 		Bucket: aws.String(u.bucket),
 		Key:    aws.String(key),
-		Body:   bytes.NewReader(data),
+		Body:   r,
 	}
 
 	// Preserve metadata
@@ -83,17 +81,11 @@ func (u *S3Uploader) Upload(ctx context.Context, obj types.ObjectInfo, data []by
 		input.Metadata = obj.Metadata
 	}
 
-	// Use multipart upload for large files
-	if int64(len(data)) > u.multipartSize {
-		_, err := u.uploader.Upload(ctx, input)
-		if err != nil {
-			return fmt.Errorf("multipart upload failed: %w", err)
-		}
-	} else {
-		_, err := u.client.PutObject(ctx, input)
-		if err != nil {
-			return fmt.Errorf("PutObject failed: %w", err)
-		}
+	// Use the upload manager which handles both small and large files,
+	// and works with non-seekable readers (like io.PipeReader).
+	_, err := u.uploader.Upload(ctx, input)
+	if err != nil {
+		return fmt.Errorf("upload failed: %w", err)
 	}
 
 	return nil

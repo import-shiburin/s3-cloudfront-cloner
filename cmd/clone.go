@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -52,6 +53,8 @@ func init() {
 	cloneCmd.Flags().BoolVar(&config.Verify, "verify", false, "Verify ETag/checksum after download")
 	cloneCmd.Flags().BoolVar(&config.PreserveMetadata, "preserve-metadata", false, "Preserve object metadata")
 	cloneCmd.Flags().BoolVar(&config.DryRun, "dry-run", false, "List what would be cloned without cloning")
+	cloneCmd.Flags().Int64Var(&config.RangeThreshold, "range-threshold", 5*1024*1024*1024, "File size threshold (bytes) for chunked Range downloads")
+	cloneCmd.Flags().Int64Var(&config.ChunkSize, "chunk-size", 256*1024*1024, "Chunk size (bytes) for Range downloads")
 
 	cloneCmd.MarkFlagRequired("cloudfront-domain")
 	cloneCmd.MarkFlagRequired("private-key")
@@ -136,7 +139,7 @@ func runClone(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create downloader
-	dl := downloader.NewDownloader(config.CloudFrontDomain, cookies)
+	dl := downloader.NewDownloader(config.CloudFrontDomain, cookies, config.RangeThreshold, config.ChunkSize)
 
 	// Create uploader
 	var up uploader.Uploader
@@ -329,59 +332,126 @@ func processObject(ctx context.Context, obj types.ObjectInfo, dl *downloader.Dow
 	result := types.DownloadResult{Object: obj}
 
 	if Verbose() {
-		fmt.Printf("[verbose] Downloading: %s (%s)\n", obj.Key, formatBytes(obj.Size))
+		fmt.Printf("[verbose] Streaming: %s (%s)\n", obj.Key, formatBytes(obj.Size))
 	}
 
-	// Download from CloudFront
-	data, md5Hash, err := dl.Download(ctx, obj.Key)
-	if err != nil {
-		result.Error = fmt.Errorf("download failed: %w", err)
-		return result
-	}
+	const maxRetries = 3
+	var lastErr error
 
-	result.BytesRead = int64(len(data))
-	result.MD5Hash = md5Hash
-
-	if Verbose() {
-		fmt.Printf("[verbose] Downloaded: %s (MD5: %s)\n", obj.Key, md5Hash)
-	}
-
-	// Verify if enabled
-	if v != nil {
-		verified, err := v.Verify(obj, md5Hash)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: verification error for %s: %v\n", obj.Key, err)
-		}
-		result.Verified = verified
-		result.VerifyFail = !verified && err == nil
-
-		if Verbose() {
-			if verified {
-				fmt.Printf("[verbose] Verified: %s (ETag match)\n", obj.Key)
-			} else if err != nil {
-				fmt.Printf("[verbose] Verify skipped: %s (%v)\n", obj.Key, err)
-			} else {
-				fmt.Printf("[verbose] Verify FAILED: %s (expected: %s, got: %s)\n", obj.Key, obj.ETag, md5Hash)
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			delay := time.Second * time.Duration(1<<(attempt-1))
+			if Verbose() {
+				fmt.Printf("[verbose] Retrying %s (attempt %d/%d)\n", obj.Key, attempt+1, maxRetries+1)
+			}
+			select {
+			case <-ctx.Done():
+				result.Error = ctx.Err()
+				return result
+			case <-time.After(delay):
 			}
 		}
-	}
 
-	if Verbose() {
-		fmt.Printf("[verbose] Uploading: %s\n", obj.Key)
-	}
+		n, md5Hash, err := streamObject(ctx, obj, dl, up)
+		if err != nil {
+			lastErr = err
+			if Verbose() {
+				fmt.Printf("[verbose] Failed: %s - %v\n", obj.Key, err)
+			}
+			continue
+		}
 
-	// Upload to destination
-	if err := up.Upload(ctx, obj, data); err != nil {
-		result.Error = fmt.Errorf("upload failed: %w", err)
+		result.BytesRead = n
+		result.MD5Hash = md5Hash
+
+		if Verbose() {
+			fmt.Printf("[verbose] Streamed: %s (MD5: %s)\n", obj.Key, md5Hash)
+		}
+
+		// Verify if enabled
+		if v != nil {
+			verified, verr := v.Verify(obj, md5Hash)
+			if verr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: verification error for %s: %v\n", obj.Key, verr)
+			}
+			result.Verified = verified
+			result.VerifyFail = !verified && verr == nil
+
+			if Verbose() {
+				if verified {
+					fmt.Printf("[verbose] Verified: %s (ETag match)\n", obj.Key)
+				} else if verr != nil {
+					fmt.Printf("[verbose] Verify skipped: %s (%v)\n", obj.Key, verr)
+				} else {
+					fmt.Printf("[verbose] Verify FAILED: %s (expected: %s, got: %s)\n", obj.Key, obj.ETag, md5Hash)
+				}
+			}
+		}
+
+		result.Success = true
 		return result
 	}
 
-	if Verbose() {
-		fmt.Printf("[verbose] Completed: %s\n", obj.Key)
+	result.Error = fmt.Errorf("failed after %d retries: %w", maxRetries, lastErr)
+	return result
+}
+
+// streamObject pipes data from CloudFront directly to the uploader without
+// buffering the entire file in memory. MD5 is computed as data flows through.
+//
+// For local destinations with large files, the file is preallocated and chunks
+// are written in parallel via WriteAt, bypassing the pipe.
+func streamObject(ctx context.Context, obj types.ObjectInfo, dl *downloader.Downloader, up uploader.Uploader) (int64, string, error) {
+	// Fast path: local uploader + ranged download → preallocate and write directly.
+	if localUp, ok := up.(*uploader.LocalUploader); ok && obj.Size > 0 && obj.Size > config.RangeThreshold {
+		f, err := localUp.CreateFile(obj, obj.Size)
+		if err != nil {
+			return 0, "", fmt.Errorf("create file: %w", err)
+		}
+
+		n, md5Hash, dlErr := dl.StreamDownload(ctx, obj.Key, obj.Size, f)
+		finishErr := localUp.FinishFile(f, obj)
+
+		if dlErr != nil || finishErr != nil {
+			os.Remove(f.Name())
+			if dlErr != nil {
+				return 0, "", fmt.Errorf("download: %w", dlErr)
+			}
+			return 0, "", fmt.Errorf("finish: %w", finishErr)
+		}
+
+		return n, md5Hash, nil
 	}
 
-	result.Success = true
-	return result
+	// Standard path: pipe download into uploader (S3 or small local files).
+	pr, pw := io.Pipe()
+
+	type dlResult struct {
+		n       int64
+		md5Hash string
+		err     error
+	}
+	ch := make(chan dlResult, 1)
+
+	go func() {
+		n, hash, err := dl.StreamDownload(ctx, obj.Key, obj.Size, pw)
+		pw.CloseWithError(err) // nil means normal EOF
+		ch <- dlResult{n, hash, err}
+	}()
+
+	uploadErr := up.Upload(ctx, obj, pr)
+	pr.CloseWithError(uploadErr) // unblock writer if upload failed
+
+	res := <-ch
+
+	if res.err != nil {
+		return 0, "", fmt.Errorf("download: %w", res.err)
+	}
+	if uploadErr != nil {
+		return 0, "", fmt.Errorf("upload: %w", uploadErr)
+	}
+
+	return res.n, res.md5Hash, nil
 }
 
 func printSummary(stats types.CloneStats) {

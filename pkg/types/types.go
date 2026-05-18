@@ -50,6 +50,10 @@ type CloneConfig struct {
 	Verify           bool
 	PreserveMetadata bool
 	DryRun           bool
+
+	// Ranged download options
+	RangeThreshold int64 // bytes; files larger than this use chunked Range requests
+	ChunkSize      int64 // bytes; size of each Range request chunk
 }
 
 // DownloadResult represents the result of downloading a single object
